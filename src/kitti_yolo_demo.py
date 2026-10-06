@@ -4,30 +4,112 @@ import cv2
 from ultralytics import YOLO
 
 
-# Get the root folder of the project
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Path to the first KITTI image
-image_path = PROJECT_ROOT / "data" / "kitti" / "images" / "0000000000.png"
+IMAGE_DIR = PROJECT_ROOT / "data" / "kitti" / "images"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Load pretrained YOLO model
+OUTPUT_VIDEO = OUTPUT_DIR / "kitti_yolo_demo.mp4"
+
+
+# --------------------------------------------------
+# Load YOLO
+# --------------------------------------------------
+
 model = YOLO("yolo11n.pt")
 
-# Read image
-image = cv2.imread(str(image_path))
 
-# Make sure image loaded correctly
-if image is None:
-    raise FileNotFoundError(f"Could not load image: {image_path}")
+# --------------------------------------------------
+# Get all KITTI frames in chronological order
+# --------------------------------------------------
 
-# Run YOLO object detection
-results = model(image)
+image_paths = sorted(IMAGE_DIR.glob("*.png"))
 
-# Draw bounding boxes and labels
-annotated_image = results[0].plot()
+if not image_paths:
+    raise FileNotFoundError(f"No PNG images found in {IMAGE_DIR}")
 
-# Display result
-cv2.imshow("KITTI - YOLO Detection", annotated_image)
+print(f"Found {len(image_paths)} KITTI frames.")
 
-cv2.waitKey(0)
+
+# --------------------------------------------------
+# Read first frame to determine video dimensions
+# --------------------------------------------------
+
+first_frame = cv2.imread(str(image_paths[0]))
+
+if first_frame is None:
+    raise FileNotFoundError(f"Could not load {image_paths[0]}")
+
+height, width = first_frame.shape[:2]
+
+
+# --------------------------------------------------
+# Create output video
+# --------------------------------------------------
+
+fps = 10
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+video_writer = cv2.VideoWriter(
+    str(OUTPUT_VIDEO),
+    fourcc,
+    fps,
+    (width, height)
+)
+
+
+# --------------------------------------------------
+# Process every KITTI frame
+# --------------------------------------------------
+
+for frame_number, image_path in enumerate(image_paths):
+
+    frame = cv2.imread(str(image_path))
+
+    if frame is None:
+        print(f"Skipping {image_path}")
+        continue
+
+    # Run YOLO
+    results = model(frame, verbose=False)
+
+    # Draw detections
+    annotated_frame = results[0].plot()
+
+    # Write frame number
+    cv2.putText(
+        annotated_frame,
+        f"Frame: {frame_number}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (255, 255, 255),
+        2
+    )
+
+    # Add frame to output video
+    video_writer.write(annotated_frame)
+
+    # Display it
+    cv2.imshow("KITTI - YOLO Detection", annotated_frame)
+
+    # Wait based on desired playback FPS.
+    # Press q to quit early.
+    if cv2.waitKey(int(1000 / fps)) & 0xFF == ord("q"):
+        break
+
+
+# --------------------------------------------------
+# Clean up
+# --------------------------------------------------
+
+video_writer.release()
 cv2.destroyAllWindows()
+
+print(f"Video saved to: {OUTPUT_VIDEO}")
