@@ -1,0 +1,16 @@
+# KITTI dataset images
+data/kitti/images/
+
+# YOLO model weights
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# Generated outputs
+outputs/
