@@ -107,6 +107,7 @@ for frame_number, image_path in enumerate(image_paths):
     annotated_frame = frame.copy()
     boxes = results[0].boxes
 
+
     # boxes.id is None when no tracks are active in this frame
     if boxes is not None and boxes.id is not None:
         xyxy = boxes.xyxy.cpu().numpy()
