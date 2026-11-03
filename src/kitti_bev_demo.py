@@ -1,15 +1,14 @@
 """
-YOLO + ByteTrack + BEV projection on a KITTI drive.
+YOLO + ByteTrack + BEV projection on a KITTI raw drive.
 
-Every ByteTrack ID is projected to the ground and drawn in the top-down map
-with the SAME colour and ID as in the camera view, as a real-size footprint
-with its motion trail.
+BEV improvements over the first version:
+  - skip boxes cut off at the bottom of the image (no road-contact point -> bogus distance)
+  - hide objects far to the side (LATERAL_LIMIT)
+  - correct for the car pitching (braking/bumps) using OXTS, if available
+  - light smoothing of each object's BEV position to remove frame-to-frame jitter
+  - feed ByteTrack low-confidence boxes and use a larger input size -> fewer dropouts
 
-Keys while running:  w = toggle warped road background   q = quit
-
-Output:
-  outputs/kitti_bev.mp4      camera view (left) + metric BEV map (right)
-  outputs/tracks_bev.csv     per-frame, per-track ground positions (for motion estimation)
+Keys: w = toggle warped road, q = quit
 """
 
 import csv
@@ -20,175 +19,103 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from bev import GroundPlaneBEV, load_p2
+from bev import GroundPlaneBEV, load_p2, load_pitch
 
+# ---------------- paths ----------------
+ROOT = Path(__file__).resolve().parent.parent
+KITTI = ROOT / "data" / "kitti"
+IMAGE_DIR = KITTI / "images"                                  # <drive>_sync/image_02/data
+CALIB_FILE = KITTI / "2011_09_26 3" / "calib_cam_to_cam.txt"
+OXTS_DIR = KITTI / "oxts"                                     # <drive>_sync/oxts (optional)
+OUT = ROOT / "outputs"
+OUT.mkdir(exist_ok=True)
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-IMAGE_DIR = PROJECT_ROOT / "data" / "kitti" / "images"
-CALIB_FILE = PROJECT_ROOT / "data" / "kitti" / "2011_09_26 3" / "calib_cam_to_cam.txt"
-
-OUTPUT_DIR = PROJECT_ROOT / "outputs"
-OUTPUT_DIR.mkdir(exist_ok=True)
-OUTPUT_VIDEO = OUTPUT_DIR / "kitti_bev.mp4"
-OUTPUT_CSV = OUTPUT_DIR / "tracks_bev.csv"
-
-
-# --------------------------------------------------
-# Config
-# --------------------------------------------------
-
-FPS = 10
+# ---------------- config ----------------
+CLASSES = [0, 1, 2, 3, 5, 7]   # person, bicycle, car, motorcycle, bus, truck
+DET_CONF = 0.1                 # keep low: ByteTrack uses 0.1-0.3 boxes to bridge dropouts
+DRAW_CONF = 0.3                # boxes below this are tracked but not drawn
+IMGSZ = 1280                   # KITTI is 1242 px wide; default 640 shrinks distant cars
+LATERAL_LIMIT = 6.0            # m left/right of the camera to show (your lane + one each side)
+SMOOTHING = 0.4                # 0..1, weight of the new position (1.0 = no smoothing)
+JUMP_RESET = 5.0               # m: bigger jumps reset the smoothing instead of averaging
 TRAIL_LENGTH = 30
-CLASSES = [0, 1, 2, 3, 5, 7]  # person, bicycle, car, motorcycle, bus, truck
-CONF_THRESHOLD = 0.3
-BOTTOM_MARGIN_PX = 3     # boxes touching the image bottom have a clipped foot point
-SHOW_ROAD_WARP = False   # warped road texture behind the map (toggle with 'w')
+FPS = 20
 
-# BEV map extent: 25 m each side, 60 m ahead, 10 px per metre
-BEV_X_RANGE = (-25, 25)
-BEV_Z_RANGE = (0, 60)
-BEV_PX_PER_M = 10
+# ---------------- setup ----------------
+model = YOLO("yolo11s.pt")
+bev = GroundPlaneBEV(load_p2(CALIB_FILE))
+images = sorted(IMAGE_DIR.glob("*.png"))
+if not images:
+    raise FileNotFoundError(f"No PNG images in {IMAGE_DIR}")
+pitch = load_pitch(OXTS_DIR, len(images))
+H, W = cv2.imread(str(images[0])).shape[:2]
+panel_w = int(bev.bev_w * H / bev.bev_h)
 
+video = cv2.VideoWriter(str(OUT / "kitti_bev.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W + panel_w, H))
+csv_file = open(OUT / "tracks_bev.csv", "w", newline="")
+writer = csv.writer(csv_file)
+writer.writerow(["frame", "track_id", "class", "conf", "x1", "y1", "x2", "y2", "raw_X", "raw_Z", "X", "Z"])
 
-# --------------------------------------------------
-# Setup
-# --------------------------------------------------
-
-model = YOLO("yolo11n.pt")
-bev = GroundPlaneBEV(load_p2(CALIB_FILE), x_range=BEV_X_RANGE,
-                     z_range=BEV_Z_RANGE, px_per_m=BEV_PX_PER_M)
-
-image_paths = sorted(IMAGE_DIR.glob("*.png"))
-if not image_paths:
-    raise FileNotFoundError(f"No PNG images found in {IMAGE_DIR}")
-
-first_frame = cv2.imread(str(image_paths[0]))
-height, width = first_frame.shape[:2]
-print(f"Found {len(image_paths)} frames ({width}x{height}). Horizon row ~ {bev.horizon_v:.1f}px")
-
-# BEV panel scaled to the camera image height, placed on the right
-panel_w = int(round(bev.bev_w * height / bev.bev_h))
-
-video_writer = cv2.VideoWriter(
-    str(OUTPUT_VIDEO), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (width + panel_w, height)
-)
-
-csv_file = open(OUTPUT_CSV, "w", newline="")
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow(
-    ["frame", "track_id", "class", "conf", "x1", "y1", "x2", "y2",
-     "foot_u", "foot_v", "X_m", "Z_m", "valid"]
-)
+smoothed = {}                                         # track_id -> smoothed [X, Z]
+trails = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))
+show_road = False
 
 
-def color_for_id(track_id: int) -> tuple:
-    """Deterministic BGR colour per track ID (shared by camera view and BEV)."""
-    rng = np.random.default_rng(track_id * 9973)
-    return tuple(int(c) for c in rng.integers(60, 255, size=3))
+def color_for_id(i):
+    return tuple(int(c) for c in np.random.default_rng(int(i) * 9973).integers(60, 255, 3))
 
 
-track_history = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))   # image-space trail
-ground_history = defaultdict(lambda: deque(maxlen=TRAIL_LENGTH))  # ground-space trail (X, Z)
-unique_ids = set()
+# ---------------- main loop ----------------
+for k, path in enumerate(images):
+    frame = cv2.imread(str(path))
+    res = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=CLASSES,
+                      conf=DET_CONF, imgsz=IMGSZ, verbose=False)[0]
+    annotated, canvas = frame.copy(), bev.make_canvas(frame if show_road else None)
+    hv = int(bev.horizon(pitch[k]))
+    cv2.line(annotated, (0, hv), (W, hv), (0, 255, 255), 1)
 
-
-# --------------------------------------------------
-# Main loop
-# --------------------------------------------------
-
-for frame_number, image_path in enumerate(image_paths):
-    frame = cv2.imread(str(image_path))
-    if frame is None:
-        continue
-
-    results = model.track(
-        frame, persist=True, tracker="bytetrack.yaml",
-        classes=CLASSES, conf=CONF_THRESHOLD, verbose=False,
-    )
-
-    annotated = frame.copy()
-    canvas = bev.make_canvas(frame if SHOW_ROAD_WARP else None)
-
-    # horizon line: road markings should converge here if the calibration is right
-    hv = int(round(bev.horizon_v))
-    cv2.line(annotated, (0, hv), (width, hv), (0, 255, 255), 1)
-
-    n_tracked = n_on_map = n_invalid = 0
-    boxes = results[0].boxes
-
-    if boxes is not None and boxes.id is not None:
-        xyxy = boxes.xyxy.cpu().numpy()
-        track_ids = boxes.id.int().cpu().tolist()
-        class_ids = boxes.cls.int().cpu().tolist()
-        confs = boxes.conf.cpu().tolist()
-
-        # Project every box's bottom-centre (road contact point) to the ground at once
-        foot = np.stack([(xyxy[:, 0] + xyxy[:, 2]) / 2, xyxy[:, 3]], axis=1)
-        ground, valid = bev.image_to_ground(foot)
-        valid &= xyxy[:, 3] < height - BOTTOM_MARGIN_PX
-
-        for i, (track_id, cls_id, conf) in enumerate(zip(track_ids, class_ids, confs)):
-            n_tracked += 1
-            x1, y1, x2, y2 = xyxy[i].astype(int)
-            X, Z = ground[i]
-            ok = bool(valid[i])
-            cls_name = model.names[cls_id]
-            color = color_for_id(track_id)
-            unique_ids.add(track_id)
-
-            csv_writer.writerow(
-                [frame_number, track_id, cls_name, f"{conf:.3f}",
-                 x1, y1, x2, y2, f"{foot[i, 0]:.1f}", f"{foot[i, 1]:.1f}",
-                 f"{X:.3f}" if ok else "", f"{Z:.3f}" if ok else "", int(ok)]
-            )
-
-            # ---------- camera view ----------
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            dist = f" {Z:.1f}m" if ok else ""
-            label = f"ID {track_id} {cls_name}{dist}"
-            (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated, (x1, y1 - th - bl - 4), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(annotated, label, (x1 + 2, y1 - bl - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-            track_history[track_id].append((int((x1 + x2) / 2), y2))
-            pts = list(track_history[track_id])
-            for k in range(1, len(pts)):
-                cv2.line(annotated, pts[k - 1], pts[k], color, max(1, int(3 * k / len(pts))))
-
-            # ---------- BEV view (same ID, same colour) ----------
-            if not ok:
-                n_invalid += 1
+    if res.boxes.id is not None:
+        for box, tid, cls_id, conf in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.id.int().tolist(),
+                                          res.boxes.cls.int().tolist(), res.boxes.conf.tolist()):
+            x1, y1, x2, y2 = box
+            if y2 > H - 3:              # cut off at the bottom: foot point unknown
                 continue
-            ground_history[track_id].append((X, Z))
-            if bev.draw_object(canvas, track_id, cls_name, list(ground_history[track_id]), color):
-                n_on_map += 1
+            xz, ok = bev.image_to_ground([[(x1 + x2) / 2, y2]], pitch[k])
+            X, Z = xz[0]
+            if not ok[0] or abs(X) > LATERAL_LIMIT:
+                continue
 
-    # ---------- HUDs ----------
-    cv2.putText(annotated, f"Frame: {frame_number}   Unique IDs: {len(unique_ids)}",
-                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(canvas, f"tracked {n_tracked} | on map {n_on_map} | no ground pt {n_invalid}",
-                (6, bev.bev_h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+            # smoothing: blend with the previous position unless it jumped (new object / bad box)
+            prev = smoothed.get(tid)
+            new = np.array([X, Z])
+            if prev is not None and np.linalg.norm(new - prev) < JUMP_RESET:
+                new = SMOOTHING * new + (1 - SMOOTHING) * prev
+            smoothed[tid] = new
+            trails[tid].append(new)
 
-    panel = cv2.resize(canvas, (panel_w, height), interpolation=cv2.INTER_AREA)
-    combined = np.hstack([annotated, panel])
-    video_writer.write(combined)
+            name = model.names[cls_id]
+            writer.writerow([k, tid, name, f"{conf:.3f}", *np.round(box, 1),
+                             f"{X:.3f}", f"{Z:.3f}", f"{new[0]:.3f}", f"{new[1]:.3f}"])
+            if conf < DRAW_CONF:
+                continue
 
-    cv2.imshow("KITTI - YOLO + ByteTrack + BEV", combined)
+            color = color_for_id(tid)
+            label = f"ID {tid} {name} {new[1]:.1f}m"
+            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(annotated, label, (int(x1), int(y1) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+            bev.draw_object(canvas, tid, name, list(trails[tid]), color)
+
+    cv2.putText(annotated, f"Frame {k}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    combined = np.hstack([annotated, cv2.resize(canvas, (panel_w, H), interpolation=cv2.INTER_AREA)])
+    video.write(combined)
+    cv2.imshow("KITTI BEV", combined)
     key = cv2.waitKey(int(1000 / FPS)) & 0xFF
     if key == ord("q"):
         break
     if key == ord("w"):
-        SHOW_ROAD_WARP = not SHOW_ROAD_WARP
+        show_road = not show_road
 
-
-video_writer.release()
+video.release()
 csv_file.close()
 cv2.destroyAllWindows()
-print(f"Total unique tracked objects: {len(unique_ids)}")
-print(f"Video: {OUTPUT_VIDEO}\nTracks CSV: {OUTPUT_CSV}")
+print(f"Saved {OUT / 'kitti_bev.mp4'} and {OUT / 'tracks_bev.csv'}")
