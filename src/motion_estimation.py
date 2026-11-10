@@ -24,6 +24,8 @@ with INPUT_CSV.open("r", newline="") as infile, \
     for row in reader:
         track_id = int(row["track_id"])
         frame = int(row["frame"])
+        if not row["X"] or not row["Z"]:
+            continue
         X = float(row["X"])
         Z = float(row["Z"])
 

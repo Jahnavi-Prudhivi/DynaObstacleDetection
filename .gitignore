@@ -11,3 +11,8 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+
+data/kitti/image_03/
+outputs/*.csv
+outputs/*.mp4
+outputs/*.yaml
