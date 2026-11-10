@@ -24,7 +24,7 @@ from bev import GroundPlaneBEV, load_p2, load_pitch
 # ---------------- paths ----------------
 ROOT = Path(__file__).resolve().parent.parent
 KITTI = ROOT / "data" / "kitti"
-IMAGE_DIR = KITTI / "images"                                  # <drive>_sync/image_02/data
+IMAGE_DIR = KITTI / "image_00" / "data"                                  # <drive>_sync/image_02/data
 CALIB_FILE = KITTI / "2011_09_26 3" / "calib_cam_to_cam.txt"
 OXTS_DIR = KITTI / "oxts"                                     # <drive>_sync/oxts (optional)
 OUT = ROOT / "outputs"
@@ -39,7 +39,7 @@ LATERAL_LIMIT = 6.0            # m left/right of the camera to show (your lane +
 SMOOTHING = 0.4                # 0..1, weight of the new position (1.0 = no smoothing)
 JUMP_RESET = 5.0               # m: bigger jumps reset the smoothing instead of averaging
 TRAIL_LENGTH = 30
-FPS = 20
+FPS = 10
 
 # ---------------- setup ----------------
 model = YOLO("yolo11s.pt")

@@ -19,14 +19,15 @@ OBJECT_SIZE_M = {"car": (1.8, 4.5), "truck": (2.5, 8.0), "bus": (2.6, 11.0),
                  "person": (0.6, 0.6), "bicycle": (0.6, 1.8), "motorcycle": (0.8, 2.1)}
 
 
+
 def load_p2(calib_path):
-    """3x4 projection matrix of the left colour camera (tracking 'P2' or raw 'P_rect_02')."""
+    """3x4 projection matrix for KITTI's left grayscale camera (image_00)."""
     with open(calib_path) as f:
         for line in f:
             key, _, vals = line.partition(":")
-            if key.strip() in ("P2", "P_rect_02"):
+            if key.strip() == "P_rect_00":
                 return np.array(vals.split(), float).reshape(3, 4)
-    raise ValueError(f"No P2 / P_rect_02 in {calib_path}")
+    raise ValueError(f"No P_rect_00 in {calib_path}")
 
 
 def load_pitch(oxts_dir, n_frames, window=11):
