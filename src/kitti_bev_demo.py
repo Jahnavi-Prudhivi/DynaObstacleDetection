@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from bev import GroundPlaneBEV, load_p2, load_pitch
+from bev import GroundPlaneBEV, camera_pitch_from_calib, load_p2, load_pitch
 
 # ---------------- paths ----------------
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,13 +37,16 @@ DRAW_CONF = 0.3                # boxes below this are tracked but not drawn
 IMGSZ = 1280                   # KITTI is 1242 px wide; default 640 shrinks distant cars
 LATERAL_LIMIT = 6.0            # m left/right of the camera to show (your lane + one each side)
 SMOOTHING = 0.4                # 0..1, weight of the new position (1.0 = no smoothing)
-JUMP_RESET = 5.0               # m: bigger jumps reset the smoothing instead of averaging
+USE_CALIB_PITCH = True         # correct the camera's fixed tilt (from the 3 calib files)
+JUMP_RESET = 5.0              # m: bigger jumps reset the smoothing instead of averaging
 TRAIL_LENGTH = 30
 FPS = 20
 
 # ---------------- setup ----------------
 model = YOLO("yolo11s.pt")
-bev = GroundPlaneBEV(load_p2(CALIB_FILE))
+static_pitch = camera_pitch_from_calib(CALIB_FILE.parent) if USE_CALIB_PITCH else 0.0
+print(f"Camera tilt used: {np.degrees(static_pitch):+.2f} deg (+ = down)")
+bev = GroundPlaneBEV(load_p2(CALIB_FILE), static_pitch=static_pitch)
 images = sorted(IMAGE_DIR.glob("*.png"))
 if not images:
     raise FileNotFoundError(f"No PNG images in {IMAGE_DIR}")
