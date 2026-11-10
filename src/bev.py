@@ -30,6 +30,36 @@ def load_p2(calib_path):
     raise ValueError(f"No P_rect_00 in {calib_path}")
 
 
+def camera_pitch_from_calib(path):
+    """Static camera pitch vs the car body (rad, + = nose down), via camera -> LiDAR -> IMU.
+
+    path: a raw-data calib folder (calib_cam_to_cam / velo_to_cam / imu_to_velo .txt)
+          or a single tracking-benchmark calib file (R_rect, Tr_velo_cam, Tr_imu_velo).
+    """
+    def read(f):
+        return {k.strip(): np.array(v.split(), float) for k, _, v in
+                (l.partition(":") for l in open(f)) if v.strip() and k.strip() != "calib_time"}
+
+    def rt(R, T):
+        M = np.eye(4)
+        M[:3, :3], M[:3, 3] = R.reshape(3, 3), T
+        return M
+
+    p = Path(path)
+    if p.is_dir():
+        R_rect = read(p / "calib_cam_to_cam.txt")["R_rect_00"]
+        vc, iv = read(p / "calib_velo_to_cam.txt"), read(p / "calib_imu_to_velo.txt")
+        velo_cam, imu_velo = rt(vc["R"], vc["T"]), rt(iv["R"], iv["T"])
+    else:
+        c = read(p)
+        R_rect = c["R_rect"]
+        velo_cam, imu_velo = np.vstack([c["Tr_velo_cam"].reshape(3, 4), [0, 0, 0, 1]]), \
+                             np.vstack([c["Tr_imu_velo"].reshape(3, 4), [0, 0, 0, 1]])
+    cam_from_imu = rt(R_rect, np.zeros(3)) @ velo_cam @ imu_velo
+    forward_in_imu = cam_from_imu[:3, :3].T @ [0, 0, 1]   # IMU axes: x fwd, y left, z up
+    return -np.arcsin(forward_in_imu[2])
+
+
 def load_pitch(oxts_dir, n_frames, window=11):
     """Per-frame camera pitch wobble (rad, + = nose down) from KITTI raw OXTS.
 
@@ -51,8 +81,11 @@ def load_pitch(oxts_dir, n_frames, window=11):
 
 
 class GroundPlaneBEV:
-    def __init__(self, P2, cam_height=CAMERA_HEIGHT, x_range=(-15, 15), z_range=(0, 60), px_per_m=10):
+    def __init__(self, P2, cam_height=CAMERA_HEIGHT, x_range=(-15, 15), z_range=(0, 60), px_per_m=10,
+                 static_pitch=0.0):
+        """static_pitch: fixed camera tilt (rad, + = nose down), e.g. from camera_pitch_from_calib."""
         self.P2, self.h = np.asarray(P2, float), cam_height
+        self.static_pitch = static_pitch
         self.x_min, self.x_max = x_range
         self.z_min, self.z_max = z_range
         self.ppm = px_per_m
@@ -65,6 +98,7 @@ class GroundPlaneBEV:
         self.H_bev_from_img = A @ self._H_ground_from_img(0.0)
 
     def _H_ground_from_img(self, pitch):
+        pitch = pitch + self.static_pitch
         c, s = np.cos(pitch), np.sin(pitch)
         R = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])  # level frame -> pitched camera
         P = np.hstack([self.P2[:, :3] @ R, self.P2[:, 3:]])
@@ -72,7 +106,7 @@ class GroundPlaneBEV:
 
     def horizon(self, pitch=0.0):
         """Image row of the horizon; nothing at/above it can be on the road."""
-        return self.cy - self.fy * np.tan(pitch)
+        return self.cy - self.fy * np.tan(pitch + self.static_pitch)
 
     def image_to_ground(self, pts, pitch=0.0):
         """Pixels (N,2) -> ground (N,2) [X, Z] metres, plus a validity mask."""
