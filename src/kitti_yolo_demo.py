@@ -12,7 +12,7 @@ from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-IMAGE_DIR = PROJECT_ROOT / "data" / "kitti" / "images"
+IMAGE_DIR = PROJECT_ROOT / "data" / "kitti" / "data"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -47,7 +47,7 @@ model = YOLO("yolo11n.pt")
 image_paths = sorted(IMAGE_DIR.glob("*.png"))
 
 if not image_paths:
-    raise FileNotFoundError(f"No PNG images found in {IMAGE_DIR}")
+    raise FileNotFoundError(f"No PNG data found in {IMAGE_DIR}")
 
 print(f"Found {len(image_paths)} KITTI frames.")
 
